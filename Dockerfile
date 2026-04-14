@@ -4,6 +4,14 @@ FROM node:18-slim
 # 设置工作目录
 WORKDIR /app
 
+# 安装GIT
+RUN sed -i s@/deb.debian.org/@/mirrors.tuna.tsinghua.edu.cn/@g /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y \
+        git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # 克隆 MQTT 网关仓库
 RUN git clone -b prd https://github.com/sdweizan/xiaozhi-mqtt-gateway.git
 
