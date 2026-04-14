@@ -5,7 +5,7 @@ FROM node:18-slim
 WORKDIR /app
 
 # 克隆 MQTT 网关仓库
-RUN git clone -b prd https://github.com/sdweizan/xiaozhi-mqtt-gateway.git .
+RUN git clone -b prd https://github.com/sdweizan/xiaozhi-mqtt-gateway.git
 
 # 安装 Node.js 依赖
 RUN npm install --production
