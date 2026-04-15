@@ -496,7 +496,7 @@ class MQTTConnection {
         // 使用相对时间戳，避免超出32位范围
         const correctedTimestamp = (relativeTimeMs) % (2 ** 32);
 
-        console.log(`收到UDP音频数据从 ${this.clientId}, 长度: ${payloadLength}, 原时间戳: ${timestamp}, 修正时间戳: ${correctedTimestamp}, 序列号: ${sequence}`);
+        console.debug(`收到UDP音频数据从 ${this.clientId}, 长度: ${payloadLength}, 原时间戳: ${timestamp}, 修正时间戳: ${correctedTimestamp}, 序列号: ${sequence}`);
 
         // 处理加密数据
         const header = message.slice(0, 16);
@@ -507,7 +507,7 @@ class MQTTConnection {
             const cipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
             const payload = Buffer.concat([cipher.update(encryptedPayload), cipher.final()]);
 
-            console.log(`UDP音频解密成功，转发到WebSocket，opus长度: ${payload.length}`);
+            console.debug(`UDP音频解密成功，转发到WebSocket，opus长度: ${payload.length}`);
             // 使用修正后的时间戳
             this.bridge.sendAudio(payload, correctedTimestamp);
             this.udp.remoteSequence = sequence;
