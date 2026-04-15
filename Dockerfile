@@ -4,6 +4,9 @@ FROM node:18-slim
 # 设置工作目录
 WORKDIR /app
 
+# 设置时区为北京时间
+ENV TZ=Asia/Shanghai
+
 # 复制当前文件夹下的所有文件到工作目录
 COPY . .
 
