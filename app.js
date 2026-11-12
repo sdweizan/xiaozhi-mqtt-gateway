@@ -588,7 +588,7 @@ class MQTTConnection {
             const cipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
             const payload = Buffer.concat([cipher.update(encryptedPayload), cipher.final()]);
 
-            console.log(`收到UDP音频数据从${this.clientId}转发到WebSocket，长度: ${payload.length}, 时间戳: ${timestamp}, 序列号: ${sequence}`);
+            // console.log(`收到UDP音频数据从${this.clientId}转发到WebSocket，长度: ${payload.length}, 时间戳: ${timestamp}, 序列号: ${sequence}`);
             this.bridge.sendAudio(payload, timestamp);
             this.udp.remoteSequence = sequence;
         } catch (decryptionError) {
