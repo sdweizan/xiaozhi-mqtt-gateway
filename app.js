@@ -12,7 +12,45 @@ const Emitter = require('events');
 const WebSocket = require('ws');
 const { MQTTProtocol } = require('./mqtt-protocol');
 const { ConfigManager } = require('./utils/config-manager');
+const { CallManager } = require('./utils/call-manager');
 const { validateMqttCredentials } = require('./utils/mqtt_config_v2');
+
+// libopus-wasm 编码器缓存（用于生成静音帧）
+let opusEncoderPromise = null;
+let opusEncoder = null;
+let cachedSilenceFrame = null;  // 预编码的静音帧，启动时生成
+
+async function warmupOpusEncoder() {
+    const encoder = await getOpusEncoder();
+    // 预编码一个静音帧缓存起来，发送时直接用
+    const silentPCM = new Int16Array(960);
+    const encoded = encoder.encode(silentPCM, { frameSize: 960 });
+    cachedSilenceFrame = Buffer.from(encoded);
+    console.log(`OPUS encoder warmed up, silence frame size: ${cachedSilenceFrame.length}`);
+}
+
+function getOpusEncoder() {
+    if (opusEncoder) return Promise.resolve(opusEncoder);
+    if (!opusEncoderPromise) {
+        opusEncoderPromise = (async () => {
+            const libopus = await import('libopus-wasm');
+            opusEncoder = await libopus.createEncoder({
+                channels: 1,
+                sampleRate: 16000,
+                frameSize: 960,  // 60ms at 16kHz = 960 samples
+            });
+            return opusEncoder;
+        })();
+    }
+    return opusEncoderPromise;
+}
+
+function generateOpusSilenceFrame() {
+    return cachedSilenceFrame;
+}
+
+// 确保编码器已初始化（启动时调用一次）
+warmupOpusEncoder().catch(e => console.error('OPUS encoder init failed:', e));
 
 
 function setDebugEnabled(enabled) {
@@ -300,12 +338,23 @@ class MQTTConnection {
         }
         this.mcpPendingRequests = {};
 
+        // 清理设备通话状态
+        if (this.macAddress) {
+            const peerConn = this.server.callManager.getPeerConnection(this.macAddress);
+            // 必须先获取session_id，再调用clearDevice（因为clearDevice会删除callSessionIds）
+            const peerSessionId = peerConn ? this.server.callManager.getCallSessionId(peerConn.macAddress) : null;
+            this.server.callManager.clearDevice(this.macAddress);
+            if (peerConn && peerSessionId) {
+                peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: peerSessionId, reason: '对方已离开' }));
+            }
+        }
+
         if (this.bridge) {
             this.bridge.close();
             this.bridge = null;
-        } else {
-            this.protocol.close();
         }
+
+        this.protocol.close();
     }
 
     checkKeepAlive() {
@@ -405,7 +454,10 @@ class MQTTConnection {
         this.bridge.on('close', () => {
             const seconds = (Date.now() - this.udp.startTime) / 1000;
             console.log(`通话结束: ${this.clientId} Session: ${this.udp.session_id} Duration: ${seconds}s`);
-            this.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: this.udp.session_id }));
+            // 通话状态下不发送 goodbye 消息
+            if (!this.server.callManager.isInCall(this.macAddress)) {
+                this.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: this.udp.session_id }));
+            }
             this.bridge = null;
             if (this.closing) {
                 this.protocol.close();
@@ -414,6 +466,20 @@ class MQTTConnection {
 
         try {
             console.log(`通话开始: ${this.clientId} Protocol: ${json.version} ${this.bridge.chatServer}`);
+
+            // 设备重新连接AI服务端，清理之前的通话状态
+            // 必须先获取通话session_id，再调用clearDevice（因为clearDevice会删除session_id）
+            const callSessionId = this.server.callManager.getCallSessionId(this.macAddress);
+            const clearResult = this.server.callManager.clearDevice(this.macAddress);
+            if (clearResult.peerMac) {
+                const peerConn = this.server.getConnectionByMac(clearResult.peerMac);
+                if (peerConn) {
+                    const goodbyeSessionId = callSessionId || this.udp.session_id;
+                    peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: goodbyeSessionId }));
+                    console.log(`通话状态已清理，已通知对方 ${clearResult.peerMac} 发送 goodbye, session=${goodbyeSessionId}`);
+                }
+            }
+
             const helloReply = await this.bridge.connect(json.audio_params, json.features);
             this.udp.session_id = helloReply.session_id;
             this.sendMqttMessage(JSON.stringify({
@@ -464,52 +530,66 @@ class MQTTConnection {
             return;
         }
 
+        if (json.type === 'udp_timeout') {
+            console.log(`设备 ${this.clientId} 报告 UDP 接收超时，重置会话`);
+            this.bridge.close();
+            this.bridge = null;
+            return;
+        }
+
         this.bridge.sendJson(json);
     }
 
     onUdpMessage(rinfo, message, payloadLength, timestamp, sequence) {
+        // 检查是否在通话桥接中 - 优先于bridge检查
+        if (this.server.callManager.isInCall(this.macAddress)) {
+            const peerConn = this.server.callManager.getPeerConnection(this.macAddress);
+            const header = message.slice(0, 16);
+            const encryptedPayload = message.slice(16, 16 + payloadLength);
+
+            try {
+                // 统一解密
+                const decipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
+                const payload = Buffer.concat([decipher.update(encryptedPayload), decipher.final()]);
+
+                // 发送给通话对方或 pending 回声（发给自己）
+                const targetConn = (peerConn && peerConn.udp?.key && peerConn.udp?.remoteAddress) ? peerConn : this;
+                if (targetConn === this) {
+                    // pending 回声：发送OPUS静音帧
+                    const silentPayload = generateOpusSilenceFrame();
+                    if (silentPayload) {
+                        this.sendUdpEncrypted(targetConn, silentPayload);
+                    }
+                } else {
+                    this.sendUdpEncrypted(targetConn, payload);
+                }
+                return;
+            } catch (e) {
+                console.error(`通话处理失败: ${e.message}`);
+            }
+            return;
+        }
+
         if (!this.bridge) {
             return;
         }
         if (this.udp.remoteAddress !== rinfo) {
             this.udp.remoteAddress = rinfo;
-            // 初始化音频时间戳基准
-            this.udp.audioStartTime = Date.now();
-            this.udp.audioSequenceStart = sequence;
-            this.udp.remoteSequence = sequence - 1; // 设置为当前序列号-1，这样下次检查会通过
         }
         if (sequence < this.udp.remoteSequence) {
             return;
         }
-        if (sequence !== this.udp.remoteSequence + 1) {
-            console.warn(`Received audio packet with wrong sequence: ${sequence}, expected: ${this.udp.remoteSequence + 1}`, {
-                remoteAddress: rinfo.address,
-                remotePort: rinfo.port,
-                clientId: this.clientId
-            });
-        }
-
-        // 由于设备发送的时间戳为0，我们根据序列号生成时间戳
-        // 假设每个音频包60ms (Opus帧时长)，使用32位时间戳
-        const frameMs = 60;
-        const relativeTimeMs = (sequence - this.udp.audioSequenceStart) * frameMs;
-        // 使用相对时间戳，避免超出32位范围
-        const correctedTimestamp = (relativeTimeMs) % (2 ** 32);
-
-        console.log(`收到UDP音频数据从 ${this.clientId}, 长度: ${payloadLength}, 原时间戳: ${timestamp}, 修正时间戳: ${correctedTimestamp}, 序列号: ${sequence}`);
 
         // 处理加密数据
         const header = message.slice(0, 16);
         const encryptedPayload = message.slice(16, 16 + payloadLength);
 
-        // 添加解密错误处理
         try {
             const cipher = crypto.createDecipheriv(this.udp.encryption, this.udp.key, header);
             const payload = Buffer.concat([cipher.update(encryptedPayload), cipher.final()]);
 
-            console.log(`UDP音频解密成功，转发到WebSocket，opus长度: ${payload.length}`);
-            // 使用修正后的时间戳
-            this.bridge.sendAudio(payload, correctedTimestamp);
+            console.log(`收到UDP音频数据从${this.clientId}转发到WebSocket，长度: ${payload.length}, 时间戳: ${timestamp}, 序列号: ${sequence}`);
+            this.bridge.sendAudio(payload, timestamp);
             this.udp.remoteSequence = sequence;
         } catch (decryptionError) {
             console.error(`UDP 解密失败: ${decryptionError.message}`, {
@@ -521,6 +601,21 @@ class MQTTConnection {
             });
             return;
         }
+    }
+
+    // 加密并发送 UDP 消息（targetConn 为对方连接时发给对方，为 this 时发给自己）
+    sendUdpEncrypted(targetConn, payload) {
+        const seq = ++targetConn.udp.localSequence;
+        targetConn.headerBuffer.writeUInt8(1, 0);
+        targetConn.headerBuffer.writeUInt8(0, 1);
+        targetConn.headerBuffer.writeUInt16BE(payload.length, 2);
+        targetConn.headerBuffer.writeUInt32BE(targetConn.connectionId, 4);
+        targetConn.headerBuffer.writeUInt32BE(0, 8);
+        targetConn.headerBuffer.writeUInt32BE(seq, 12);
+
+        const cipher = crypto.createCipheriv(targetConn.udp.encryption, targetConn.udp.key, targetConn.headerBuffer);
+        const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+        this.server.sendUdpMessage(Buffer.concat([targetConn.headerBuffer, encrypted]), targetConn.udp.remoteAddress);
     }
 
     isAlive() {
@@ -624,6 +719,10 @@ class MQTTServer {
         this.keepAliveCheckInterval = 1000; // 默认每1秒检查一次
 
         this.headerBuffer = Buffer.alloc(16);
+
+        // 初始化通话管理器
+        this.callManager = new CallManager();
+        this.callManager.getConnectionByMac = (mac) => this.getConnectionByMac(mac);
     }
 
     generateNewConnectionId() {
@@ -677,6 +776,16 @@ class MQTTServer {
                 connection.checkKeepAlive();
             }
 
+            // 清理超时的pending通话
+            const cleanedCalls = this.callManager.cleanupTimeoutCalls(60000);
+            for (const { mac, peerMac } of cleanedCalls) {
+                const conn = this.getConnectionByMac(mac);
+                if (conn) {
+                    conn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: conn.udp.session_id }));
+                    console.log(`已发送超时goodbye给 ${mac}`);
+                }
+            }
+
             const activeCount = Array.from(this.connections.values()).filter(connection => connection.isAlive()).length;
             if (activeCount !== this.lastActiveConnectionCount || this.connections.size !== this.lastConnectionCount) {
                 console.log(`连接数: ${this.connections.size}, 活跃数: ${activeCount}`);
@@ -714,6 +823,19 @@ class MQTTServer {
 
     removeConnection(connection) {
         debug(`关闭连接: ${connection.connectionId}`);
+
+        // 清理设备通话状态并通知对方
+        if (connection.macAddress) {
+            const peerConn = this.callManager.getPeerConnection(connection.macAddress);
+            // 必须先获取session_id，再调用clearDevice（因为clearDevice会删除callSessionIds）
+            const peerSessionId = peerConn ? this.callManager.getCallSessionId(peerConn.macAddress) : null;
+            this.callManager.clearDevice(connection.macAddress);
+            // 通知对方通话结束（使用对端的session_id）
+            if (peerConn && peerSessionId) {
+                peerConn.sendMqttMessage(JSON.stringify({ type: 'goodbye', session_id: peerSessionId }));
+            }
+        }
+
         if (this.connections.has(connection.connectionId)) {
             this.connections.delete(connection.connectionId);
         }
@@ -806,6 +928,28 @@ class MQTTServer {
             }
         }
         return null;
+    }
+
+    // 通过MAC地址查找连接
+    getConnectionByMac(mac) {
+        const normalizedMac = mac?.toLowerCase();
+        for (const connection of this.connections.values()) {
+            if (connection.macAddress && connection.macAddress.toLowerCase() === normalizedMac) {
+                return connection;
+            }
+        }
+        return null;
+    }
+
+    // 通过groupId查找连接
+    getConnectionsByGroupId(groupId) {
+        const connections = [];
+        for (const connection of this.connections.values()) {
+            if (connection.groupId === groupId) {
+                connections.push(connection);
+            }
+        }
+        return connections;
     }
 }
 
@@ -932,6 +1076,130 @@ app.post('/api/devices/status', authenticateRequest, (req, res) => {
     } catch (error) {
         console.error('处理设备状态查询错误:', error);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ========== 通话管理 API ==========
+
+// 发起通话请求（服务端调用）
+app.post('/api/call/request', authenticateRequest, (req, res) => {
+    try {
+        const { caller_mac, target_mac, caller_nickname } = req.body;
+
+        if (!caller_mac || !target_mac) {
+            return res.status(400).json({ error: '缺少必要参数: caller_mac, target_mac' });
+        }
+
+        // 先检查被叫方是否在线
+        const targetConn = server.getConnectionByMac(target_mac);
+        if (!targetConn) {
+            return res.json({
+                status: 'offline',
+                message: '对方设备不在线，请稍后重试'
+            });
+        }
+
+        // 在线才发起呼叫
+        const result = server.callManager.requestCall(caller_mac, target_mac, caller_nickname);
+
+        // 通话请求成功，断开设备的 bridge，让设备进入通话模式
+        if (result.status === 'bridged' || result.status === 'pending') {
+            const callerConn = server.getConnectionByMac(caller_mac);
+            // 必须在断开bridge前记录session_id，因为断开后device会进入通话模式，session_id会变化
+            const callerSessionId = callerConn?.udp?.session_id;
+            if (callerConn?.bridge) {
+                callerConn.bridge.close();
+                callerConn.bridge = null;
+                console.log(`通话请求成功，已断开设备 ${caller_mac} 的 bridge`);
+            }
+            // 记录主叫方进入通话模式前的session_id（bridge模式的session）
+            if (callerSessionId) {
+                server.callManager.setCallSessionId(caller_mac, callerSessionId);
+            }
+        }
+
+        // 如果是双向匹配建立桥接，被叫方也已经进入了通话模式，需要记录被叫方的session_id
+        if (result.status === 'bridged' && result.peerMac) {
+            const targetConn = server.getConnectionByMac(target_mac);
+            if (targetConn?.udp?.session_id) {
+                server.callManager.setCallSessionId(target_mac, targetConn.udp.session_id);
+            }
+        }
+
+        if (result.status === 'pending') {
+            // 远程唤醒被叫方
+            const wakeupMessage = {
+                type: 'mcp',
+                payload: {
+                    jsonrpc: '2.0',
+                    id: 9999,
+                    method: 'tools/call',
+                    params: {
+                        name: 'self.remote_wakeup',
+                        arguments: {
+                            reason: `[device_call]您收到来自${caller_nickname || '未知'}的来电，是否接听？`,
+                            action: 'listen'
+                        }
+                    }
+                }
+            };
+            targetConn.sendMqttMessage(JSON.stringify(wakeupMessage));
+            console.log(`已发送远程唤醒给 ${target_mac}: 来自${caller_nickname}的来电`);
+        }
+
+        res.json({
+            status: result.status,
+            message: result.message
+        });
+    } catch (error) {
+        console.error('处理通话请求错误:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// 接听通话请求（被叫方调用）
+app.post('/api/call/accept', authenticateRequest, (req, res) => {
+    try {
+        const { mac } = req.body;
+
+        if (!mac) {
+            return res.status(400).json({ error: '缺少必要参数: mac' });
+        }
+
+        const result = server.callManager.joinCall(mac);
+
+        if (result.status === 'bridged') {
+            // 获取对方的连接并通知对方通话已建立
+            const peerMac = result.peerMac;
+            const peerConn = server.getConnectionByMac(peerMac);
+            if (peerConn) {
+                peerConn.sendMqttMessage(JSON.stringify({ type: 'call_accepted', from: mac }));
+            }
+            // 断开设备的 bridge，让设备进入通话模式
+            const calleeConn = server.getConnectionByMac(mac);
+            // 必须在断开bridge前记录session_id，因为断开后device会进入通话模式，session_id会变化
+            const calleeSessionId = calleeConn?.udp?.session_id;
+            const peerSessionId = peerConn?.udp?.session_id;
+            if (calleeConn?.bridge) {
+                calleeConn.bridge.close();
+                calleeConn.bridge = null;
+                console.log(`通话接听成功，已断开设备 ${mac} 的 bridge`);
+            }
+            console.log(`通话已建立: ${mac} <-> ${peerMac}`);
+
+            // 记录进入通话模式前的session_id（bridge模式的session）
+            if (calleeSessionId) {
+                server.callManager.setCallSessionId(mac, calleeSessionId);
+            }
+            if (peerSessionId) {
+                server.callManager.setCallSessionId(peerMac, peerSessionId);
+            }
+        }
+
+        res.json(result);
+    } catch (error) {
+        console.error('处理接听请求错误:', error);
+        res.status(500).json({ status: 'error', message: error.message });
     }
 });
 
